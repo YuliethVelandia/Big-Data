@@ -1,0 +1,176 @@
+---
+title: "Taller 1 - Big Data"
+author: "Yulieth Velandia Rojas / Hans Rodríguez"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+date: "2023-03-12"
+---
+
+## Introducción
+Este taller tiene como objetivo hacer uso de las librerías dplyr, arrow y duckdb para realizar diferentes tipos de análisis en la data obtenida del censo nacional de población y vivienda realizado en el año 2018. 
+
+### Carga de información y librerías
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(arrow)
+library(dplyr)
+library(duckdb)
+library(reshape2)
+library(DBI)
+library(readxl)
+```
+
+Posteriormente, se procede a realizar la carga de los archivos parquet
+
+```{r}
+#setwd("C:/Users/yulie/OneDrive/Documentos/Semestre 3/Big Data/censo_unificado")
+setwd("C:/Users/yulie/OneDrive/Documentos/Semestre 3/Big Data/Censo_unificado/parquet")
+df_viviendas_lz <-open_dataset("viviendas")
+df_personas_lz <-open_dataset("personas")
+df_hogares_lz <-open_dataset("hogares")
+
+```
+Finalizado este proceso, ya se pueden realizar diferentes análisis respecto a la data completa del censo.
+
+
+### 1. Calcular la proporción de indígenas, afrocolombianos por área urbana y rural
+
+Para realizar este análisis, se hace uso de la variable UA_CLASE de la base de viviendas, que es la que nos presenta la información de zona. Debido a que presenta 4 opciones, se parametriza para agrupar los valores de las variables en urbana o rural.
+
+```{r}
+df_viviendas_lz2 <- df_viviendas_lz %>%select(COD_ENCUESTAS, UA_CLASE) %>%  mutate(tipo_vivienda = ifelse(UA_CLASE %in% c("1","2"),"Urbana","Rural"))
+```
+
+Asimismo se carga el dataframe con el diccionario de datos de los diferentes grupos étnicos.
+```{r}
+Grupo_etnia <- read_excel("C:/Users/yulie/OneDrive/Documentos/Semestre 3/Big Data/Censo_unificado/parquet/Grupo_etnico.xlsx")
+grupos_etnias<-df_personas_lz %>% select(COD_ENCUESTAS, UA_CLASE,PA1_GRP_ETNIC )%>% right_join(Grupo_etnia)
+```
+
+Definido lo anterior, se procede a hacer el pipeline que permite identificar cual es la cantidad de población indígenas y afrocolombiana del área urbana y del área rural.
+```{r}
+consulta_etnia <- grupos_etnias  %>% right_join(df_viviendas_lz2) %>% select(COD_ENCUESTAS, UA_CLASE, PA1_GRP_ETNIC, Nombre_Grupo, tipo_vivienda) %>%  filter(PA1_GRP_ETNIC==1 | PA1_GRP_ETNIC==5)%>% select(-COD_ENCUESTAS) %>%  group_by(tipo_vivienda,Nombre_Grupo) %>% summarise(cuenta = n()) %>% collect()
+```  
+
+
+```{r}
+consultaetnia_P <- dcast(data = consulta_etnia, formula =tipo_vivienda~Nombre_Grupo, value.var ="cuenta")%>% mutate(Proporción_Indigena=Indígena/sum(Indígena)*100) %>% mutate(Proporción_Afro=Afrodescendiente/sum(Afrodescendiente)*100) %>%select(1,2,5,3,4) %>% collect() 
+consultaetnia_P
+```
+
+
+
+### 2. Utilice la tabla de viviendas y calcule la tabla de frecuencias y relativas
+
+Para este análisis se debe hacer uso los dos grupos de datos correspondientes a viviendas y personas.
+
+
+```{r}
+consulta_estrato <- df_viviendas_lz %>% select(COD_ENCUESTAS, VA1_ESTRATO) %>% 
+  right_join(df_personas_lz %>% select(COD_ENCUESTAS)) %>% filter( VA1_ESTRATO !=9 & VA1_ESTRATO !=0)%>% group_by(VA1_ESTRATO) %>% summarise(Frecuencia = n()) %>% collect() %>% mutate(Freq_relativa = (Frecuencia/sum(Frecuencia))*100) %>% arrange(desc(VA1_ESTRATO))
+```
+
+Obteniendo como resultado:
+```{r}
+consulta_estrato
+```
+
+
+
+### 3. Calcule con arrow y duckdb la proporción de bogotanos mayores (estricto) de 25 años que han alcanzado el siguiente máximo nivel educativo: primaria o menos, bachiller,  técnica profesional/tecnológica o educación superior o posgrado:
+
+Para el siguiente análisis se hace uso de Duckdb y se realiza la consulta con lenguaje SQL. Aquí se hace uso únicamente del grupo de datos "Personas"
+
+```{r}
+con3 <- DBI::dbConnect(duckdb::duckdb(),dbdir = "bd_col_personas")
+df_personas_duck <- to_duckdb(df_personas_lz, con3,"personasColombia_duck")
+```
+
+
+```{r}
+sql_bogotanos <- "
+SELECT U_DPTO, P_NIVEL_ANOSR, count(*) as Cantidad
+FROM personasColombia_duck 
+WHERE U_DPTO = 11 AND P_EDADR > 6 AND P_NIVEL_ANOSR <>99 AND P_NIVEL_ANOSR <>10
+GROUP BY U_DPTO,P_NIVEL_ANOSR
+ORDER BY Cantidad DESC
+"
+consulta_bta <- dbGetQuery(con3, sql_bogotanos)
+consulta_bta
+```
+
+Posteriormente, se obtiene la proporción de cada uno de los niveles de educación:
+
+```{r}
+consulta_bta %>% mutate(Nivel=case_when(P_NIVEL_ANOSR %in% c(1,2)~"Primaria o menos",P_NIVEL_ANOSR %in% c(3,4,5,6)~"Bachiller",P_NIVEL_ANOSR %in% c(7,8,9)~"Educación Superior o Posgrado"))%>% select(Nivel,Cantidad) %>% group_by(Nivel) %>% summarise(Total_grupo=sum(Cantidad)) %>% mutate(Proporcion_bta = (Total_grupo/sum(Total_grupo))*100) %>% arrange(desc(Total_grupo))
+consulta_bta
+```
+
+
+### 4. Calcule el número de personas por hogar por nivel socioeconómico
+
+El siguiente análisis requiere usar el conjunto relacionado a hogares y el relacionado a viviendas, para finalmente calcular el promedio de personas por hogar en cada estrato
+
+```{r}
+consulta_hogares <- df_viviendas_lz %>% select(COD_ENCUESTAS, VA1_ESTRATO) %>% 
+  right_join(df_hogares_lz %>% select(COD_ENCUESTAS, HA_TOT_PER))  %>% filter( VA1_ESTRATO !=9 & VA1_ESTRATO !=0)%>% select(-COD_ENCUESTAS)  %>% group_by(VA1_ESTRATO) %>% summarise(Personas_hogar = mean(HA_TOT_PER))%>% arrange(desc(Personas_hogar)) %>% collect()
+
+consulta_hogares
+```
+
+
+### 5. Calcular la siguiente tabla:
+
+
+Para hacer el cálculo de la tabla solicitada, se importa el diccionario de los datos del nivel educativo y los estratos, para realizar un join por el ID de la encuesta:
+
+
+```{r}
+Nivel_educativo <- read_excel("C:/Users/yulie/OneDrive/Documentos/Semestre 3/Big Data/Censo_unificado/parquet/Nivel_educativo.xlsx")
+
+Estratos <- read_excel("C:/Users/yulie/OneDrive/Documentos/Semestre 3/Big Data/Censo_unificado/parquet/Estratos.xlsx")
+
+```
+
+
+```{r}
+grupos_nivel_edu<-df_personas_lz %>% select(COD_ENCUESTAS,P_NIVEL_ANOSR)%>% right_join(Nivel_educativo)
+estratificacion<-df_viviendas_lz %>% select(COD_ENCUESTAS,VA1_ESTRATO)%>% right_join(Estratos)
+```
+
+
+
+```{r}
+consulta_est_educ <- grupos_nivel_edu %>% select(COD_ENCUESTAS,P_NIVEL_ANOSR,Nivel_Educativo) %>% right_join(estratificacion %>% select(COD_ENCUESTAS, VA1_ESTRATO,ESTRATO)) %>%  select(-COD_ENCUESTAS)  %>% mutate(Nivel_edu=case_when(P_NIVEL_ANOSR %in% c(1,2)~"Primaria o menos",P_NIVEL_ANOSR %in% c(3,4,5,6)~"Bachiller",P_NIVEL_ANOSR %in% c(7,8,9)~"Educación Superior o Posgrado")) %>%  filter( VA1_ESTRATO !=9 & VA1_ESTRATO !=0 & P_NIVEL_ANOSR!= 10 & P_NIVEL_ANOSR!= 99)%>% group_by(ESTRATO,Nivel_edu) %>% summarise(cantidad = n()) %>%  collect()
+```
+
+
+```{r}
+est_edu_pivot<-dcast(data = consulta_est_educ, formula =Nivel_edu~ESTRATO,
+      value.var ="cantidad") 
+```
+
+
+```{r}
+proporcion_edu<-est_edu_pivot %>% mutate(Freq_R_E1=(Estrato_1/sum(Estrato_1)*100))%>% mutate(Freq_R_E2=(Estrato_2/sum(Estrato_2)*100))%>% mutate(Freq_R_E3=(Estrato_3/sum(Estrato_3)*100))%>% mutate(Freq_R_E4=(Estrato_4/sum(Estrato_4)*100))%>% mutate(Freq_R_E5=(Estrato_5/sum(Estrato_5)*100))%>% mutate(Freq_R_E6=(Estrato_6/sum(Estrato_6)*100)) %>% rename(Frec_est_1=Estrato_1,Frec_est_2=Estrato_2,Frec_est_3=Estrato_3,Frec_est_4=Estrato_4,Frec_est_5=Estrato_5,Frec_est_6=Estrato_6) %>% select(1,2,8,3,9,4,10,5,11,6,12,7,13)
+totales <-proporcion_edu %>% summarise(across(2:13,sum))
+consulta_totales <-proporcion_edu %>% add_row(totales)
+```
+
+
+El resultado del análisis realizado muestra la siguiente tabla, donde se muestra la frecuencia del nivel educativo (Frec_est) y la proporción de la misma (Freq_r_)
+
+```{r}
+consulta_totales
+```
+
+
+¿En qué estrato socioeconómico está la gente más educada?
+Las personas con Educación Superior o Posgrado representan la mayor parte de la población de los estratos 5 (65.5.%) y 6 (68.8%).
+
